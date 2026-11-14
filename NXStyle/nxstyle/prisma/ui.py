@@ -513,7 +513,16 @@ class SelectionObserver:
 
     def addSelection(self, doc, obj, sub, point):
         if not self.owner.selecting and self.owner.session.active:
-            self.owner.collect(reference(doc, obj, sub, xyz(point)))
+            # FreeCAD queues notifications made inside a selection callback.
+            # Collect outside that queue so highlight() cannot feed its own picks
+            # back into the collector after the selecting guard has been reset.
+            dialog = self.owner.dialog
+            ref = reference(doc, obj, sub, xyz(point))
+            QtCore.QTimer.singleShot(0, lambda: self.deliver(dialog, ref))
+
+    def deliver(self, dialog, ref):
+        if not self.owner.selecting and self.owner.session.active and self.owner.dialog is dialog:
+            self.owner.collect(ref)
 
 
 class Controller(QtCore.QObject):
@@ -541,7 +550,8 @@ class Controller(QtCore.QObject):
         self.timer.setInterval(90)
         self.timer.timeout.connect(self.update)
         self.observer = SelectionObserver(self)
-        Gui.Selection.addObserver(self.observer)
+        no_resolve = getattr(getattr(Gui.Selection, "ResolveMode", None), "NoResolve", 0)
+        Gui.Selection.addObserver(self.observer, no_resolve)
 
     @property
     def dialog(self):

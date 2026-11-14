@@ -53,7 +53,7 @@ class PrismaUiQt(unittest.TestCase):
         self.mw.show()
         self.gui.getMainWindow = lambda: self.mw
         self.selection = []
-        self.gui.Selection = types.SimpleNamespace(addObserver=lambda observer: None,
+        self.gui.Selection = types.SimpleNamespace(addObserver=lambda *args: None,
             getSelectionEx=lambda: [], clearSelection=self.selection.clear,
             addSelection=lambda *args: self.selection.append(args))
         solid = types.SimpleNamespace(Shape=types.SimpleNamespace(Solids=[object()]))
@@ -623,6 +623,137 @@ class PrismaUiQt(unittest.TestCase):
         del self.gui.Selection.addSelectionGate
         del self.gui.Selection.removeSelectionGate
         selection._manager = None
+
+    def test_native_datum_inheritance_is_accepted_by_point_vector_and_plane_collectors(self):
+        selection = importlib.import_module(self.package_name + ".selection_filter")
+        selection._manager = None
+        self.gui.Selection.addSelectionGate = lambda *args: None
+        self.gui.Selection.removeSelectionGate = lambda: None
+        self.gui.Control = types.SimpleNamespace(activeDialog=lambda: None)
+        self.gui.ActiveDocument = types.SimpleNamespace(ActiveView=types.SimpleNamespace(getActiveObject=lambda *args: None))
+        # Match modern native datum inheritance. These inheritance-only stubs
+        # omit Shape so classification cannot rely on its synthetic accessor.
+        class Geometry:
+            def __init__(self, name, native_type, app_base, part_base):
+                self.Name = self.Label = name
+                self.TypeId = native_type
+                self.bases = (native_type, app_base, part_base)
+            def isDerivedFrom(self, type_id):
+                return type_id in self.bases
+            def getParentGeoFeatureGroup(self):
+                return None if self.Name == "PrismaPart" else part
+            def getSubObject(self, sub, _mode=0):
+                return objects[sub.rstrip(".")]
+        part = Geometry("PrismaPart", "App::Part", "App::GeoFeature", "App::DocumentObject")
+        objects = {"PrismaPart": part,
+                   "Point": Geometry("Point", "Prisma::ConstructionPoint", "App::Point", "Part::DatumPoint"),
+                   "Axis": Geometry("Axis", "Prisma::ConstructionAxis", "App::Line", "Part::DatumLine"),
+                   "Plane": Geometry("Plane", "Prisma::ConstructionPlane", "App::Plane", "Part::DatumPlane")}
+        self.doc.getObject = objects.get
+        manager = selection.manager()
+        manager.set_global(kind="body")
+        try:
+            for kind, method, name, collector in (("block", None, "Point", "origin"),
+                                                   ("vector", "axis", "Axis", "object"),
+                                                   ("plane", "coincident", "Plane", "object")):
+                with self.subTest(kind=kind):
+                    self.command.begin(kind)
+                    if method:
+                        combo = self.command.dialog.method
+                        combo.setCurrentIndex(combo.findData(method))
+                    dialog = self.command.dialog
+                    self.assertEqual(dialog.active_collector, collector)
+                    for top, sub in ((name, ""), ("PrismaPart", name + ".")):
+                        allowed, reason, pick = manager.verdict("Model", top, sub)
+                        self.assertEqual(pick.kind, "datum")
+                        self.assertTrue(allowed, reason)
+                        self.assertTrue(self.command.collect(self.ui.reference("Model", top, sub)))
+                        self.assertTrue(dialog.collector_complete(collector))
+                        # Offering the same reference toggles simple collectors;
+                        # clear it explicitly before testing the next identity.
+                        dialog.clear_collector(collector)
+                    self.command.cancel_current()
+            self.assertIsNone(manager.top())
+        finally:
+            while self.command.session.active:
+                self.command.cancel_current()
+            del self.gui.Selection.addSelectionGate
+            del self.gui.Selection.removeSelectionGate
+            selection._manager = None
+
+    def test_native_selection_notification_collects_on_next_turn_without_highlight_recursion(self):
+        root = self.command.begin("block")
+        original = deepcopy(root.spec)
+        pending = []
+        notifying = [False]
+        notification_states = []
+        # Native selection queues nested notifications until the outer observer
+        # returns. Bound this faithful simulation so a regression fails, not hangs.
+        def notify(doc, obj, sub="", point=(0, 0, 0)):
+            self.selection.append((doc, obj, sub))
+            pending.append((doc, obj, sub, point))
+            if notifying[0]:
+                return
+            notifying[0] = True
+            try:
+                deliveries = 0
+                while pending:
+                    deliveries += 1
+                    if deliveries > 12:
+                        raise AssertionError("Selection highlighting recursively recollected native notifications")
+                    notification_states.append(self.command.selecting)
+                    self.command.observer.addSelection(*pending.pop(0))
+            finally:
+                notifying[0] = False
+        self.gui.Selection.addSelection = notify
+        point = [2, 3, 4]
+        with patch.object(self.command, "collect", wraps=self.command.collect) as collect:
+            notify("Model", "Point", "", point)
+            self.assertEqual(collect.call_count, 0)
+            self.assertEqual(root.spec, original)
+            point[:] = [99, 99, 99]
+            self.app.processEvents()
+            self.assertEqual(collect.call_count, 1)
+            collected = root.spec["origin"]["references"]["object"][0]
+            self.assertEqual(collected, self.ui.reference("Model", "Point", "", (2, 3, 4)))
+            self.assertTrue(root.collector_complete("origin"))
+            self.assertEqual(notification_states, [False, True])
+            self.app.processEvents()
+            self.assertEqual(collect.call_count, 1)
+            self.assertEqual(self.adapter.features, [])
+
+    def test_pending_native_selection_is_ignored_after_cancel_or_dialog_change(self):
+        for transition in ("cancel", "new_root", "open_nested", "close_nested", "change_method"):
+            with self.subTest(transition=transition):
+                self.command.begin("block")
+                if transition == "close_nested":
+                    self.command.open_constructor("origin")
+                try:
+                    with patch.object(self.command, "collect", wraps=self.command.collect) as collect:
+                        self.command.observer.addSelection("Model", "Point", "", (1, 2, 3))
+                        self.assertEqual(collect.call_count, 0)
+                        if transition in ("cancel", "new_root"):
+                            self.command.cancel_current()
+                            if transition == "new_root":
+                                self.command.begin("block")
+                        elif transition == "open_nested":
+                            self.command.open_constructor("origin")
+                        elif transition == "close_nested":
+                            self.command.cancel_current()
+                        else:
+                            combo = self.command.dialog.method
+                            combo.setCurrentIndex(combo.findData("two_points_height"))
+                        dialog = self.command.dialog
+                        expected = deepcopy(dialog.spec) if dialog else None
+                        self.app.processEvents()
+                        self.assertEqual(collect.call_count, 0)
+                        if dialog:
+                            self.assertEqual(dialog.spec, expected)
+                        self.assertEqual(self.adapter.features, [])
+                finally:
+                    while self.command.session.active:
+                        self.command.cancel_current()
+                    self.app.processEvents()
 
     def test_role_inheritance_preview_cancel_and_apply_leave_sources_untouched(self):
         boot = importlib.import_module(self.package_name + ".prisma.boot")

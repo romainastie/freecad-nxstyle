@@ -48,7 +48,10 @@ def _leaf(obj, sub):
 
 
 def _is_datum(o):
-    return (o.isDerivedFrom("Part::Datum") or o.TypeId in ("App::Plane", "App::Line", "App::Point", "App::Origin"))
+    # Modern Part datums (and Prisma subclasses) derive from App geometry,
+    # while legacy PartDesign datums derive from Part::Datum.
+    return (any(o.isDerivedFrom(base) for base in ("Part::Datum", "App::Plane", "App::Line", "App::Point"))
+            or o.TypeId == "App::Origin")
 
 
 def type_ok(kind, obj, sub):

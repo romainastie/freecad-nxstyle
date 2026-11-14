@@ -92,6 +92,109 @@ class NativeModel(unittest.TestCase):
         self.assertEqual(loaded["method"], "diagonal_points")
         self.assertEqual(loaded["point2"]["references"]["object"][0]["object"], second.Name)
 
+    def test_inferred_whole_points_are_associative_block_origins(self):
+        native = self.adapter.commit(self.point(7,8,9))
+        app_point = self.doc.addObject("App::Point","AppPoint")
+        app_point.Placement.Base = self.App.Vector(4,5,6)
+        imported = self.doc.addObject("Part::Feature","ImportedPoint")
+        imported.Shape = self.Part.Point(self.App.Vector(10,20,30)).toShape()
+        for source in (native,app_point,imported):
+            with self.subTest(type=source.TypeId):
+                inferred = command_spec("point","inferred")
+                inferred["references"]["object"] = [{"object":source.Name}]
+                expected = self.Part.getShape(source,needSubElement=True).Vertexes[0].Point
+                before = len(self.doc.Objects)
+                preview = self.adapter.preview(inferred)
+                self.assertTrue(preview.valid,preview.error)
+                self.assertLess((self.App.Vector(*preview.values["point"])-expected).Length,1e-7)
+                spec = self.block()
+                spec["origin"] = inferred
+                self.assertTrue(self.adapter.preview(spec).valid)
+                self.assertEqual(len(self.doc.Objects),before)
+                block = self.adapter.commit(spec)
+                if source is native:
+                    source.setExpression("X","17 mm")
+                elif source is app_point:
+                    source.Placement.Base = self.App.Vector(14,5,6)
+                else:
+                    source.Shape = self.Part.Point(self.App.Vector(20,20,30)).toShape()
+                self.doc.recompute()
+                expected = self.Part.getShape(source,needSubElement=True).Vertexes[0].Point
+                self.assertLess((block.Placement.Base-expected).Length,1e-7)
+                loaded = self.adapter.load(block)["origin"]
+                self.assertEqual(loaded["method"],"inferred")
+                self.assertEqual(loaded["references"]["object"][0]["object"],source.Name)
+
+    def test_qualified_datum_points_support_block_and_three_point_plane(self):
+        part = self.model._part(self.doc)
+        part.Placement = self.App.Placement(self.App.Vector(100,200,300),
+                                            self.App.Rotation(self.App.Vector(0,0,1),90))
+        inner = self.doc.addObject("App::Part","NestedDatums")
+        part.addObject(inner)
+        inner.Placement = self.App.Placement(self.App.Vector(5,6,7),
+                                             self.App.Rotation(self.App.Vector(0,0,1),90))
+        points = []
+        for x,y in ((0,0),(10,0),(0,10)):
+            point = self.doc.addObject("Prisma::ConstructionPoint","DatumPoint")
+            inner.addObject(point)
+            point.X,point.Y = x,y
+            points.append(point)
+        self.doc.recompute()
+        definitions = []
+        for point in points:
+            spec = command_spec("point","inferred")
+            spec["references"]["object"] = [{"object":part.Name,
+                "subelement":inner.Name+"."+point.Name+"."}]
+            result = self.adapter.preview(spec)
+            self.assertTrue(result.valid,result.error)
+            self.assertLess((self.App.Vector(*result.values["point"])-point.getGlobalPlacement().Base).Length,1e-7)
+            definitions.append(spec)
+        block = self.block()
+        block["origin"] = definitions[0]
+        solid = self.adapter.commit(block)
+        plane = command_spec("plane","three_points")
+        for key,definition in zip(("point1","point2","point3"),definitions):
+            plane[key] = definition
+        preview = self.adapter.preview(plane)
+        self.assertTrue(preview.valid,preview.error)
+        datum = self.adapter.commit(plane)
+        self.assertTrue(preview.placement.isSame(datum.Placement,1e-7))
+        points[0].Z = 2
+        self.doc.recompute()
+        expected = part.getGlobalPlacement().inverse().multiply(points[0].getGlobalPlacement()).Base
+        for feature in (solid,datum):
+            self.assertEqual(feature.Diagnostic,"")
+            self.assertLess((feature.Placement.Base-expected).Length,1e-7)
+        restored = self.adapter.load(solid)["origin"]["references"]["object"][0]
+        self.assertEqual(restored["object"],part.Name)
+        self.assertEqual(restored["subelement"],inner.Name+"."+points[0].Name+".")
+
+    def test_qualified_axis_and_linked_point_inference_use_native_geometry(self):
+        part = self.model._part(self.doc)
+        inner = self.doc.addObject("App::Part","NestedFrame")
+        part.addObject(inner)
+        inner.Placement = self.App.Placement(self.App.Vector(2,3,4),
+                                             self.App.Rotation(self.App.Vector(0,0,1),90))
+        axis = self.doc.addObject("Prisma::ConstructionAxis","DatumAxis")
+        inner.addObject(axis)
+        axis.Direction = self.App.Vector(1,0,0)
+        point = self.adapter.commit(self.point(1,2,3))
+        link = self.doc.addObject("App::Link","PointOccurrence")
+        part.addObject(link)
+        link.LinkedObject = point
+        link.Placement.Base = self.App.Vector(30,40,50)
+        self.doc.recompute()
+        for kind,source,sub,native_method in (("vector",part,inner.Name+"."+axis.Name+".","Edge"),
+                                               ("point",link,"","Vertex")):
+            with self.subTest(kind=kind):
+                spec = command_spec(kind,"inferred")
+                spec["references"]["object"] = [{"object":source.Name,"subelement":sub}]
+                result = self.adapter.preview(spec)
+                self.assertTrue(result.valid,result.error)
+                expected = self.native.evaluate("Axis" if kind=="vector" else "Point",
+                    {"Method":native_method,"Support":[(source,[sub])],"Context":part.getGlobalPlacement()})
+                self.assertTrue(result.placement.isSame(expected,1e-7))
+
     def test_inline_subtract_matches_standalone_and_preserves_tool_option(self):
         target = self.adapter.commit(self.block())
         tool = self.adapter.commit(self.block(5, 0, 0))

@@ -334,9 +334,13 @@ class ModelAdapter:
         if not refs:
             raise ValueError("Select an object")
         obj, subs = self._ref(refs[0])
-        if subs[0]:
-            return obj.getSubObject(subs[0])
-        return obj.Shape
+        # Whole datums have computed geometry rather than a Shape property, and
+        # getSubObject can return None for a qualified whole-datum path. Resolve
+        # them through the same native Part shape service used by construction.
+        shape = self.Part.getShape(obj, subs[0], needSubElement=True, transform=True)
+        if shape.isNull():
+            raise ValueError("The selected reference no longer resolves to geometry")
+        return shape
 
     def _infer_point(self, spec):
         shape = self._first_shape(spec)
