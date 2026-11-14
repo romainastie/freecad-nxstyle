@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 """Native integration; only the explicit pure-test mode skips this suite."""
 import os
+import ctypes
 from pathlib import Path
 import sys
 import tempfile
@@ -39,6 +40,114 @@ class NativeModel(unittest.TestCase):
         spec["origin"] = self.point(x, y, z)
         spec["fields"].update(length=str(length), width=str(width), height=str(height))
         return spec
+
+    def _console_warnings(self, operation):
+        """Capture the native Console observer's stderr, including C stdio."""
+        previous = self.App.Console.GetStatus("Console", "Wrn")
+        flush = ctypes.CDLL(None).fflush
+        with tempfile.TemporaryFile() as output:
+            flush(None)
+            saved = os.dup(2)
+            try:
+                os.dup2(output.fileno(), 2)
+                self.App.Console.SetStatus("Console", "Wrn", True)
+                operation()
+                flush(None)
+            finally:
+                os.dup2(saved, 2)
+                os.close(saved)
+                self.App.Console.SetStatus("Console", "Wrn", previous)
+            output.seek(0)
+            return output.read().decode("utf-8", errors="replace")
+
+    def _legacy_container_links(self):
+        part = self.model._part(self.doc)
+        for name, type_id in (("CurrentOutputs", "App::PropertyLinkList"),
+                              ("WorkCoordinateSystem", "App::PropertyLink")):
+            value = getattr(part, name)
+            part.removeProperty(name)
+            part.addProperty(type_id, name, "Saved group", "Saved documentation", 5)
+            setattr(part, name, value)
+            part.setPropertyStatus(name, "NoRecompute")
+        return part
+
+    def test_model_container_metadata_recompute_has_no_scope_warnings(self):
+        def create_and_recompute():
+            self.adapter.commit(self.block())
+            self.model.set_wcs(self.doc, self.App.Placement(self.App.Vector(4, 5, 6), self.App.Rotation()))
+            part = self.model._part(self.doc)
+            for _ in range(3):
+                part.touch()
+                self.doc.recompute()
+        self.assertNotIn("go out of the allowed scope", self._console_warnings(create_and_recompute))
+
+    def test_legacy_container_scope_repair_preserves_values_metadata_undo_and_restore(self):
+        first = self.adapter.commit(self.block())
+        second = self.adapter.commit(self.block(20))
+        wcs = self.model.set_wcs(self.doc, self.App.Placement(self.App.Vector(12, 2, 3), self.App.Rotation()))
+        part = self._legacy_container_links()
+        probe = self.doc.addObject("App::FeaturePython", "ExpressionProbe")
+        probe.addProperty("App::PropertyLength", "Value")
+        expression = part.Name + ".WorkCoordinateSystem.Placement.Base.x"
+        probe.setExpression("Value", expression)
+        old_status = {name: part.getPropertyStatus(name) for name in self.model._CONTAINER_LINKS}
+        part.touch()
+        warning = self._console_warnings(self.doc.recompute)
+        self.assertIn("Link(s) to object(s) 'N/A' go out of the allowed scope 'PrismaPart'", warning)
+        self.assertTrue(self.adapter.preview(self.block()).valid)
+        self.assertEqual(part.getTypeIdOfProperty("CurrentOutputs"), "App::PropertyLinkList")
+        warnings = self._console_warnings(lambda: self.assertTrue(self.model.repair_document_metadata(self.doc)))
+        self.assertNotIn("go out of the allowed scope", warnings)
+        for name, type_id in self.model._CONTAINER_LINKS.items():
+            self.assertEqual(part.getTypeIdOfProperty(name), type_id)
+            self.assertEqual(part.getGroupOfProperty(name), "Saved group")
+            self.assertEqual(part.getDocumentationOfProperty(name), "Saved documentation")
+            self.assertEqual(part.getTypeOfProperty(name), ["ReadOnly", "Hidden"])
+            self.assertEqual(part.getPropertyStatus(name), old_status[name])
+            self.assertEqual(part.getEditorMode(name), ["ReadOnly", "Hidden"])
+        self.assertEqual(list(part.CurrentOutputs), [first, second])
+        self.assertEqual(part.WorkCoordinateSystem, wcs)
+        self.assertAlmostEqual(probe.Value.Value, 12)
+        self.assertEqual(dict(probe.ExpressionEngine)["Value"], expression)
+        self.doc.undo()
+        self.assertEqual(part.getTypeIdOfProperty("CurrentOutputs"), "App::PropertyLinkList")
+        self.assertEqual(list(part.CurrentOutputs), [first, second])
+        self.assertEqual(part.WorkCoordinateSystem, wcs)
+        self.doc.redo()
+        self.assertEqual(part.getTypeIdOfProperty("CurrentOutputs"), "App::PropertyLinkListChild")
+        self.assertEqual(list(part.CurrentOutputs), [first, second])
+        self.assertEqual(part.WorkCoordinateSystem, wcs)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "scoped.FCStd")
+            self.doc.saveAs(path)
+            self.App.closeDocument(self.doc.Name)
+            self.doc = self.App.openDocument(path)
+            part = self.model._part(self.doc)
+            for name, type_id in self.model._CONTAINER_LINKS.items():
+                self.assertEqual(part.getTypeIdOfProperty(name), type_id)
+            part.touch()
+            self.assertNotIn("go out of the allowed scope", self._console_warnings(self.doc.recompute))
+            self.assertAlmostEqual(sum(obj.Shape.Volume for obj in part.CurrentOutputs), 2000)
+            self.assertAlmostEqual(part.WorkCoordinateSystem.Placement.Base.x, 12)
+            self.assertFalse(self.model.repair_document_metadata(self.doc))
+
+    def test_legacy_scope_repair_is_atomic_when_locked_and_automatic_on_commit(self):
+        self.adapter.commit(self.block())
+        wcs = self.model.set_wcs(self.doc, self.App.Placement())
+        part = self._legacy_container_links()
+        part.setPropertyStatus("WorkCoordinateSystem", "LockDynamic")
+        before = list(self.doc.UndoNames)
+        with self.assertRaisesRegex(ValueError, "Unlock Model.WorkCoordinateSystem"):
+            self.model.repair_document_metadata(self.doc)
+        self.assertEqual(list(self.doc.UndoNames), before)
+        self.assertEqual(part.getTypeIdOfProperty("CurrentOutputs"), "App::PropertyLinkList")
+        self.assertEqual(part.WorkCoordinateSystem, wcs)
+        part.setPropertyStatus("WorkCoordinateSystem", "-LockDynamic")
+        self.adapter.commit(self.block(20))
+        self.assertEqual(part.getTypeIdOfProperty("CurrentOutputs"), "App::PropertyLinkListChild")
+        self.assertEqual(part.getTypeIdOfProperty("WorkCoordinateSystem"), "App::PropertyLinkChild")
+        self.assertEqual(part.WorkCoordinateSystem, wcs)
+        self.assertEqual(len(part.CurrentOutputs), 2)
 
     def test_preview_has_no_document_artifacts_and_validates_required_origin(self):
         before = [o.Name for o in self.doc.Objects]

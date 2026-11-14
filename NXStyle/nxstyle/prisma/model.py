@@ -14,6 +14,8 @@ _TYPES = {"point": "Prisma::ConstructionPoint", "axis": "Prisma::ConstructionAxi
           "vector": "Prisma::ConstructionAxis", "plane": "Prisma::ConstructionPlane",
           "block": "Prisma::Block", "cylinder": "Prisma::Cylinder"}
 _BOOLEANS = {"unite": "Part::Fuse", "subtract": "Part::Cut", "intersect": "Part::Common"}
+_CONTAINER_LINKS = {"CurrentOutputs": "App::PropertyLinkListChild",
+                    "WorkCoordinateSystem": "App::PropertyLinkChild"}
 
 
 def _runtime():
@@ -30,9 +32,75 @@ def _part(doc, create=False):
         part.Label = "Model"
         part.addProperty("App::PropertyBool", "PrismaModel", "PRISMA")
         part.PrismaModel = True
-        part.addProperty("App::PropertyLinkList", "CurrentOutputs", "PRISMA")
-        part.addProperty("App::PropertyLink", "WorkCoordinateSystem", "PRISMA")
+    if part is not None and create:
+        _ensure_container_links(part)
     return part
+
+
+def _ensure_container_links(part):
+    """Keep container metadata within its descendants; preserve legacy values.
+
+    Local link scope means the owner's siblings in FreeCAD, so it cannot be
+    used for an App::Part's references to its own outputs or WCS. The Child
+    property subclasses also persist the correct scope through FCStd restore.
+    Call only while creating a document or inside a mutating transaction.
+    """
+    pending = []
+    flag_bits = {"ReadOnly": 1, "Transient": 2, "Hidden": 4, "Output": 8,
+                 "NoRecompute": 16, "NoPersist": 32}
+    for name, type_id in _CONTAINER_LINKS.items():
+        if name not in part.PropertiesList:
+            pending.append((name, type_id, None))
+        elif part.getTypeIdOfProperty(name) != type_id:
+            status = part.getPropertyStatus(name)
+            if "LockDynamic" in status:
+                raise ValueError(f"Unlock Model.{name} before repairing its link scope")
+            pending.append((name, type_id, {
+                "value": getattr(part, name), "group": part.getGroupOfProperty(name),
+                "documentation": part.getDocumentationOfProperty(name),
+                "flags": sum(flag_bits[flag] for flag in part.getTypeOfProperty(name)),
+                "status": status,
+                "expressions": [(path, expression) for path, expression in part.ExpressionEngine
+                                if path == name or path.startswith(name + ".")
+                                or path.startswith(name + "[")]}))
+    for name, type_id, saved in pending:
+        if saved is None:
+            part.addProperty(type_id, name, "PRISMA")
+            continue
+        if not part.removeProperty(name):
+            raise ValueError(f"Cannot repair Model.{name}: the property cannot be replaced")
+        part.addProperty(type_id, name, saved["group"], saved["documentation"], saved["flags"])
+        setattr(part, name, saved["value"])
+        for path, expression in saved["expressions"]:
+            part.setExpression(path, expression)
+        part.setPropertyStatus(name, saved["status"])
+    return bool(pending)
+
+
+def repair_document_metadata(doc):
+    """Repair legacy model link scopes in one undoable operation.
+
+    Existing geometry, output ordering and WCS placement are preserved. Normal
+    commits perform the same repair inside their own transaction; previews do
+    not modify an existing document.
+    """
+    App, _, _ = _runtime()
+    if App.getActiveTransaction():
+        raise RuntimeError("Finish the current operation before repairing model metadata")
+    part = _part(doc)
+    if part is None or all(name in part.PropertiesList and part.getTypeIdOfProperty(name) == type_id
+                           for name, type_id in _CONTAINER_LINKS.items()):
+        return False
+    App.setActiveDocument(doc.Name)
+    App.setActiveTransaction("Repair model metadata", True)
+    try:
+        changed = _ensure_container_links(part)
+        doc.recompute()
+        App.closeActiveTransaction(False)
+        return changed
+    except Exception:
+        App.closeActiveTransaction(True)
+        raise
 
 
 def new_document(name="Unnamed"):
