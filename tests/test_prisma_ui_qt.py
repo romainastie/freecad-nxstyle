@@ -261,13 +261,13 @@ class PrismaUiQt(unittest.TestCase):
         self.assertFalse(self.command.show_result())
         self.assertEqual(len(shown), 1)
 
-    def navigation(self):
+    def navigation(self, widget_type=QtWidgets.QWidget if QtCore is not None else None):
         # Use the real viewport event filter. Camera rendering is a host service.
         stub = types.ModuleType(self.package_name + ".commands")
         with patch.dict(sys.modules, {stub.__name__: stub}):
             module = importlib.import_module(self.package_name + ".navigation")
         module.config._cfg = dict(module.config.DEFAULTS)
-        widget = QtWidgets.QWidget(self.mw)
+        widget = widget_type(self.mw)
         widget.resize(500, 400)
         widget.show()
         view = types.SimpleNamespace(getObjectInfo=lambda point: None, getPoint=lambda x, y: (12, 8, 3))
@@ -279,6 +279,157 @@ class PrismaUiQt(unittest.TestCase):
         mouse.zoom = lambda *args: None
         widget.installEventFilter(mouse)
         return module, mouse, widget
+
+    def test_raw_mac_command_drag_orbits_without_changing_active_constructor(self):
+        root = self.command.begin("block")
+        original = deepcopy(root.spec)
+        module, mouse, widget = self.navigation()
+        rotations = []
+        mouse.rotate = lambda *args: rotations.append(args)
+        command_modifier = QtCore.Qt.ControlModifier
+        start = QtCore.QPoint(50, 50)
+        # On macOS Qt maps physical Command to ControlModifier by default.
+        with patch.dict(os.environ, {"PRISMA_PROFILE": "1"}), \
+                patch.object(module, "sys", types.SimpleNamespace(platform="darwin")), \
+                patch.object(self.command, "pointer", wraps=self.command.pointer) as pointer:
+            QtTest.QTest.mousePress(widget, QtCore.Qt.LeftButton, command_modifier, pos=start)
+            self.assertEqual(pointer.call_count, 0)
+            small = start + QtCore.QPoint(module.MOVE_THRESHOLD, 0)
+            event = module.mouse_event(QtCore.QEvent.MouseMove, small, QtCore.Qt.NoButton,
+                                       QtCore.Qt.LeftButton, command_modifier)
+            self.app.sendEvent(widget, event)
+            self.assertEqual(rotations, [])
+            self.assertEqual(root.spec, original)
+            dragged = QtCore.QPoint(80, 75)
+            event = module.mouse_event(QtCore.QEvent.MouseMove, dragged, QtCore.Qt.NoButton,
+                                       QtCore.Qt.LeftButton, command_modifier)
+            self.app.sendEvent(widget, event)
+            self.assertEqual(len(rotations), 1)
+            # Releasing Command before MB1 must not turn the remaining drag into a pick.
+            QtTest.QTest.keyRelease(widget, QtCore.Qt.Key_Control)
+            continued = QtCore.QPoint(90, 85)
+            event = module.mouse_event(QtCore.QEvent.MouseMove, continued, QtCore.Qt.NoButton,
+                                       QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+            self.app.sendEvent(widget, event)
+            self.assertEqual(len(rotations), 2)
+            QtTest.QTest.mouseRelease(widget, QtCore.Qt.LeftButton, pos=continued)
+            self.assertEqual(pointer.call_count, 0)
+            self.assertEqual(root.spec, original)
+            self.assertEqual(self.adapter.features, [])
+            self.assertFalse(mouse.command_lmb)
+            self.assertFalse(mouse.lmb_pending)
+            # A fresh ordinary click proves the completed orbit released its event state.
+            QtTest.QTest.mouseClick(widget, QtCore.Qt.LeftButton, pos=start)
+            self.assertEqual(pointer.call_count, 1)
+            self.assertEqual(root.spec["origin"]["fields"], {"x": "12", "y": "8", "z": "0"})
+
+    def test_raw_mac_command_click_picks_on_release_without_orbit_or_commit(self):
+        root = self.command.begin("block")
+        original = deepcopy(root.spec)
+        module, mouse, widget = self.navigation()
+        rotations = []
+        mouse.rotate = lambda *args: rotations.append(args)
+        command_modifier = QtCore.Qt.ControlModifier
+        start = QtCore.QPoint(50, 50)
+        with patch.dict(os.environ, {"PRISMA_PROFILE": "1"}), \
+                patch.object(module, "sys", types.SimpleNamespace(platform="darwin")), \
+                patch.object(self.command, "pointer", wraps=self.command.pointer) as pointer:
+            QtTest.QTest.mousePress(widget, QtCore.Qt.LeftButton, command_modifier, pos=start)
+            self.assertEqual(pointer.call_count, 0)
+            self.assertEqual(root.spec, original)
+            QtTest.QTest.mouseRelease(widget, QtCore.Qt.LeftButton, command_modifier, pos=start)
+            self.assertEqual(pointer.call_count, 1)
+            self.assertEqual(root.spec["origin"]["fields"], {"x": "12", "y": "8", "z": "0"})
+            self.assertEqual(rotations, [])
+            self.assertEqual(self.adapter.features, [])
+            self.assertFalse(mouse.command_lmb)
+            self.assertFalse(mouse.lmb_pending)
+
+    def recording_navigation(self):
+        class RecordingViewport(QtWidgets.QWidget):
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.received = []
+            def mousePressEvent(self, event):
+                self.received.append((event.type(), event.button(), event.modifiers()))
+                event.accept()
+            def mouseReleaseEvent(self, event):
+                self.received.append((event.type(), event.button(), event.modifiers()))
+                event.accept()
+        module, mouse, widget = self.navigation(RecordingViewport)
+        mouse.cfg["quickpick_hold_ms"] = 0
+        return module, mouse, widget
+
+    def test_raw_idle_mac_command_click_replays_native_events_with_modifier(self):
+        module, mouse, widget = self.recording_navigation()
+        command_modifier = QtCore.Qt.ControlModifier
+        start = QtCore.QPoint(50, 50)
+        with patch.dict(os.environ, {"PRISMA_PROFILE": "1"}), \
+                patch.object(module, "sys", types.SimpleNamespace(platform="darwin")):
+            QtTest.QTest.mousePress(widget, QtCore.Qt.LeftButton, command_modifier, pos=start)
+            self.assertEqual(widget.received, [])
+            QtTest.QTest.mouseRelease(widget, QtCore.Qt.LeftButton, command_modifier, pos=start)
+            self.assertEqual(widget.received, [
+                (QtCore.QEvent.MouseButtonPress, QtCore.Qt.LeftButton, command_modifier),
+                (QtCore.QEvent.MouseButtonRelease, QtCore.Qt.LeftButton, command_modifier)])
+            self.assertFalse(mouse.command_lmb)
+            self.assertFalse(mouse.lmb_pending)
+
+    def test_raw_command_left_chord_keeps_native_right_button_press_and_release_paired(self):
+        module, mouse, widget = self.recording_navigation()
+        rotations = []
+        mouse.rotate = lambda *args: rotations.append(args)
+        point = QtCore.QPoint(50, 50)
+        command_modifier = QtCore.Qt.ControlModifier
+        with patch.dict(os.environ, {"PRISMA_PROFILE": "1"}), \
+                patch.object(module, "sys", types.SimpleNamespace(platform="darwin")):
+            press = module.mouse_event(QtCore.QEvent.MouseButtonPress, point, QtCore.Qt.RightButton,
+                                       QtCore.Qt.RightButton, QtCore.Qt.NoModifier)
+            self.app.sendEvent(widget, press)
+            self.assertTrue(mouse.rmb_pending)
+            # Explicit button sets represent both physical buttons being held.
+            chord = module.mouse_event(QtCore.QEvent.MouseButtonPress, point, QtCore.Qt.LeftButton,
+                                       QtCore.Qt.LeftButton | QtCore.Qt.RightButton, command_modifier)
+            self.app.sendEvent(widget, chord)
+            self.assertFalse(mouse.command_lmb)
+            release = module.mouse_event(QtCore.QEvent.MouseButtonRelease, point, QtCore.Qt.RightButton,
+                                         QtCore.Qt.LeftButton, command_modifier)
+            self.app.sendEvent(widget, release)
+            release = module.mouse_event(QtCore.QEvent.MouseButtonRelease, point, QtCore.Qt.LeftButton,
+                                         QtCore.Qt.NoButton, command_modifier)
+            self.app.sendEvent(widget, release)
+            for button in (QtCore.Qt.RightButton, QtCore.Qt.LeftButton):
+                self.assertEqual([kind for kind, received_button, _mods in widget.received if received_button == button],
+                                 [QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease])
+            self.assertFalse(mouse.rmb_pending)
+            self.assertEqual(rotations, [])
+
+    def test_raw_fresh_left_press_clears_escaped_orbit_release_after_missed_mouse_up(self):
+        module, mouse, widget = self.recording_navigation()
+        point = QtCore.QPoint(50, 50)
+        with patch.dict(os.environ, {"PRISMA_PROFILE": "1"}), \
+                patch.object(module, "sys", types.SimpleNamespace(platform="darwin")):
+            QtTest.QTest.mousePress(widget, QtCore.Qt.LeftButton, QtCore.Qt.ControlModifier, pos=point)
+            QtTest.QTest.keyClick(widget, QtCore.Qt.Key_Escape)
+            self.assertFalse(mouse.command_lmb)
+            self.assertEqual(mouse.swallow_release, QtCore.Qt.LeftButton)
+            # The cancelled press's release occurred outside the app and was not delivered.
+            self.app.sendEvent(widget, QtCore.QEvent(QtCore.QEvent.WindowDeactivate))
+            QtTest.QTest.mousePress(widget, QtCore.Qt.LeftButton, pos=point)
+            self.assertIsNone(mouse.swallow_release)
+            QtTest.QTest.mouseRelease(widget, QtCore.Qt.LeftButton, pos=point)
+            self.assertEqual(widget.received, [
+                (QtCore.QEvent.MouseButtonPress, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier),
+                (QtCore.QEvent.MouseButtonRelease, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)])
+            self.assertFalse(mouse.command_lmb)
+
+    def test_physical_mac_command_modifier_respects_qt_swap_attribute(self):
+        module, mouse, widget = self.navigation()
+        with patch.object(module, "sys", types.SimpleNamespace(platform="darwin")):
+            for dont_swap, modifier in ((False, QtCore.Qt.ControlModifier), (True, QtCore.Qt.MetaModifier)):
+                application = types.SimpleNamespace(testAttribute=lambda _attribute, value=dont_swap: value)
+                with patch.object(module, "QtWidgets", types.SimpleNamespace(QApplication=application)):
+                    self.assertEqual(module.command_modifier(), modifier)
 
     def test_raw_three_button_events_pick_apply_and_radial(self):
         self.command.begin("block")

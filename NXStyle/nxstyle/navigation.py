@@ -6,6 +6,7 @@ the right-button hold; everything else falls through to FreeCAD's Blender
 navigation style (MB1 select, wheel zoom, MB3 click context menu).
 
     MB2 drag                    rotate (about the view centre)
+    Command+MB1 drag (PRISMA)   rotate; a click keeps normal selection
     press-and-hold MB2, drag    rotate about the point under the cursor
     Shift+MB2 or MB2+MB3 drag   pan
     Ctrl+MB2 or MB1+MB2 drag    zoom
@@ -22,6 +23,7 @@ then handed to FreeCAD unchanged; only the hold and the select-through click are
 
 import math
 import os
+import sys
 import time
 
 import FreeCAD as App
@@ -44,6 +46,13 @@ def prisma_command():
         return None
     from .prisma.ui import current
     return current()
+
+
+def command_modifier():
+    """Physical Command on macOS; Qt normally maps it to ControlModifier."""
+    if sys.platform == "darwin" and not QtWidgets.QApplication.testAttribute(Qt.AA_MacDontSwapCtrlAndMeta):
+        return Qt.ControlModifier
+    return Qt.MetaModifier
 
 
 def _coin():
@@ -201,6 +210,8 @@ class NxMouse(QtCore.QObject):
         self.triad = None
         self.mode = None
         self.lmb_rotate = False
+        self.command_lmb = False
+        self.command_lmb_dragged = False
         self.orbit = orbit_core.NX   # how the current rotation turns the camera (read_orbit)
         self.swallow_release = None
         self.manager = None
@@ -233,9 +244,9 @@ class NxMouse(QtCore.QObject):
         except Exception:
             return None
 
-    def replay(self, kind, button, p):
+    def replay(self, kind, button, p, modifiers=Qt.NoModifier):
         ev = mouse_event(kind, p, button, button if kind == QtCore.QEvent.MouseButtonPress else Qt.NoButton,
-                         Qt.NoModifier)
+                         modifiers)
         self._replaying = True
         try:
             QtWidgets.QApplication.sendEvent(self.widget, ev)
@@ -509,7 +520,14 @@ class NxMouse(QtCore.QObject):
 
     def eventFilter(self, obj, ev):
         t = ev.type()
+        if obj is self.widget and t in (QtCore.QEvent.WindowDeactivate, QtCore.QEvent.Hide,
+                                        QtCore.QEvent.UngrabMouse):
+            self.command_lmb = False
         if t == QtCore.QEvent.KeyPress and ev.key() == Qt.Key_Escape:
+            if self.command_lmb:
+                self.command_lmb = False
+                self.swallow_release = Qt.LeftButton
+                return True
             if self.mode:
                 self.manager.set_mode(None)
                 return True
@@ -557,14 +575,46 @@ class NxMouse(QtCore.QObject):
         own = self.owns_mouse()
         button = ev.button()
         p = pos(ev)
+        if t == QtCore.QEvent.MouseButtonPress and button == self.swallow_release:
+            # A release may have happened outside the viewport after cancellation.
+            self.swallow_release = None
         if self.swallow_release is not None and t == QtCore.QEvent.MouseButtonRelease \
                 and button == self.swallow_release:
             self.swallow_release = None
             return True
+        if self.command_lmb:
+            if t == QtCore.QEvent.MouseMove:
+                if not ev.buttons() & Qt.LeftButton:
+                    self.command_lmb = False
+                    return False
+                if not self.command_lmb_dragged and (p - self.command_lmb_start).manhattanLength() > MOVE_THRESHOLD:
+                    self.command_lmb_dragged = True
+                    self.pivot = None
+                    self.read_orbit()
+                if self.command_lmb_dragged:
+                    self.rotate(p.x() - self.command_lmb_last.x(), p.y() - self.command_lmb_last.y(), p)
+                    self.command_lmb_last = p
+                return True
+            if t == QtCore.QEvent.MouseButtonRelease and button == Qt.LeftButton:
+                self.command_lmb = False
+                if not self.command_lmb_dragged:
+                    # Delay picking until we know this was a click, never an orbit.
+                    prisma = prisma_command()
+                    if prisma is None or not prisma.pointer(self, self.command_lmb_start):
+                        self.replay(QtCore.QEvent.MouseButtonPress, Qt.LeftButton,
+                                    self.command_lmb_start, self.command_lmb_modifiers)
+                        self.replay(QtCore.QEvent.MouseButtonRelease, Qt.LeftButton, p,
+                                    self.command_lmb_modifiers)
+                return True
+            return True
         if self.mode == "rotate" and self._rotate_mode(t, ev, p):
             return True
         if t == QtCore.QEvent.MouseButtonDblClick:
-            return own and button == Qt.MiddleButton
+            if (own and button == Qt.LeftButton and ev.modifiers() & command_modifier()
+                    and os.environ.get("PRISMA_PROFILE") == "1"):
+                t = QtCore.QEvent.MouseButtonPress
+            else:
+                return own and button == Qt.MiddleButton
         if t == QtCore.QEvent.MouseButtonPress:
             self.hover_timer.stop()
             if (button == Qt.LeftButton and self.armed is not None and ev.modifiers() == Qt.NoModifier
@@ -610,6 +660,15 @@ class NxMouse(QtCore.QObject):
                     return True
                 if self.rmb_pending:
                     self._release_pending_rmb(press_only=True)
+                if (own and ev.buttons() == Qt.LeftButton and ev.modifiers() & command_modifier()
+                        and os.environ.get("PRISMA_PROFILE") == "1"):
+                    self.lmb_timer.stop()
+                    self.lmb_pending = False
+                    self.command_lmb = True
+                    self.command_lmb_dragged = False
+                    self.command_lmb_start = self.command_lmb_last = p
+                    self.command_lmb_modifiers = ev.modifiers()
+                    return True
                 prisma = prisma_command()
                 if prisma is not None and prisma.pointer(self, p):
                     self.swallow_release = Qt.LeftButton
@@ -637,7 +696,9 @@ class NxMouse(QtCore.QObject):
                     mods = ev.modifiers()   # this event's state, not a possibly stale global one
                     if self.extra_rmb or mods & Qt.ShiftModifier:
                         self.pan(dx, dy)
-                    elif self.extra_lmb or mods & Qt.ControlModifier:
+                    elif (self.extra_lmb or mods & Qt.ControlModifier
+                          or (sys.platform == "darwin" and os.environ.get("PRISMA_PROFILE") == "1"
+                              and mods & Qt.MetaModifier)):
                         self.zoom(dy)
                     else:
                         self.rotate(dx, dy, p)

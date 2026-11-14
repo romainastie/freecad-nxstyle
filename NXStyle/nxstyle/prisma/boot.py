@@ -93,7 +93,7 @@ class Shell(QtCore.QObject):
             self.save_preferences()
             QtCore.QTimer.singleShot(1500, self.offer_role)
         self.mw.setWindowTitle("PRISMA — Basic Modeling")
-        self.mw.statusBar().showMessage("PRISMA Basic Modeling · MB2 drag Rotate · Shift+MB2 Pan · Ctrl+MB2 Zoom · Hold MB3 Radial", 12000)
+        self.mw.statusBar().showMessage("PRISMA Basic Modeling · MB2 / Cmd+MB1 drag Rotate · Shift+MB2 Pan · Ctrl+MB2 Zoom · Hold MB3 Radial", 12000)
 
     def build_ribbon(self):
         from ..ribbon import Ribbon, HOST_ACTIONS, spec_groups, known_commands
