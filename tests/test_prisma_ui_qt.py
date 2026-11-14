@@ -335,6 +335,40 @@ class PrismaUiQt(unittest.TestCase):
         mouse.deleteLater()
         widget.deleteLater()
 
+    def test_prisma_branding_reaches_file_button_and_new_document_windows(self):
+        boot = importlib.import_module(self.package_name + ".prisma.boot")
+        original_icon = self.app.windowIcon()
+        original_name = self.app.applicationDisplayName()
+        self.addCleanup(self.app.setWindowIcon, original_icon)
+        self.addCleanup(self.app.setApplicationDisplayName, original_name)
+        with tempfile.TemporaryDirectory() as directory:
+            self.fc.getUserConfigDir = lambda: directory
+            shell = boot.Shell(self.mw)
+            # The host supplies the compiled SVG resource; use a real Qt icon here
+            # so this standalone test checks propagation without FreeCAD's qrc.
+            image = QtGui.QPixmap(20, 20)
+            image.fill(QtGui.QColor("#526579"))
+            shell.brand_icon = QtGui.QIcon(image)
+            button = QtWidgets.QToolButton(self.mw)
+            button.setText("File")
+            shell.ribbon = types.SimpleNamespace(file_button=button)
+            mdi = QtWidgets.QMdiArea(self.mw)
+            self.mw.setCentralWidget(mdi)
+            document = mdi.addSubWindow(QtWidgets.QWidget())
+            shell.apply_branding()
+            self.assertEqual(boot.PRISMA_ICON, ":/icons/prisma.svg")
+            self.assertEqual(self.app.applicationDisplayName(), "PRISMA")
+            expected = shell.brand_icon.cacheKey()
+            for icon in (self.app.windowIcon(), self.mw.windowIcon(), document.windowIcon(), button.icon()):
+                self.assertEqual(icon.cacheKey(), expected)
+            self.assertEqual(button.text(), "File")
+            self.assertEqual(button.toolButtonStyle(), QtCore.Qt.ToolButtonTextBesideIcon)
+            self.assertEqual(button.accessibleName(), "PRISMA File")
+            second_document = mdi.addSubWindow(QtWidgets.QWidget())
+            second_document.setWindowIcon(QtGui.QIcon())
+            shell.apply_branding()
+            self.assertEqual(second_document.windowIcon().cacheKey(), expected)
+
     def test_imported_role_shortcut_runs_only_enabled_mapped_command_and_rebinds(self):
         boot = importlib.import_module(self.package_name + ".prisma.boot")
         with tempfile.TemporaryDirectory() as directory:

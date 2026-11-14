@@ -11,6 +11,7 @@ import FreeCADGui as Gui
 from ..qt import QAction, QtCore, QtGui, QtWidgets, Qt
 
 _shell = None
+PRISMA_ICON = ":/icons/prisma.svg"
 
 
 def instance():
@@ -43,6 +44,7 @@ class Shell(QtCore.QObject):
         self.role_shortcuts = []
         self._tree_signature = None
         self.preferences = {}
+        self.brand_icon = None
         root = os.environ.get("PRISMA_USER_DATA")
         self.profile = Path(root) if root else Path(App.getUserConfigDir()) / "prisma"
         self.profile.mkdir(parents=True, exist_ok=True)
@@ -54,6 +56,7 @@ class Shell(QtCore.QObject):
         from ..navigation import NavigationManager
         from . import commands
         from .catalog import basic_layout
+        self.apply_branding()
         config._cfg = dict(config.DEFAULTS, plm="none", nxt=False, lcinterlocking=False,
                            new_part_datum=False, auto_workbench=False, navigation="nx")
         prefs.apply(config._cfg)
@@ -100,6 +103,7 @@ class Shell(QtCore.QObject):
             self.toolbar.deleteLater()
         self.ribbon = Ribbon(self.mw)
         self.ribbon.app_id = "prisma"
+        self.apply_branding()
         known = known_commands() | set(HOST_ACTIONS)
         for tab in self.layout["tabs"]:
             groups = []
@@ -139,6 +143,25 @@ class Shell(QtCore.QObject):
             self.mw.insertToolBar(self.selection_bar, self.toolbar)
             self.mw.insertToolBarBreak(self.selection_bar)
         self.install_role_shortcuts()
+
+    def apply_branding(self):
+        """Brand this opt-in shell, including native document windows created later."""
+        if self.brand_icon is None:
+            self.brand_icon = QtGui.QIcon(PRISMA_ICON)
+        app = QtWidgets.QApplication.instance()
+        app.setApplicationDisplayName("PRISMA")
+        if app.windowIcon().cacheKey() != self.brand_icon.cacheKey():
+            app.setWindowIcon(self.brand_icon)
+        for window in [self.mw] + self.mw.findChildren(QtWidgets.QMdiSubWindow):
+            if window.windowIcon().cacheKey() != self.brand_icon.cacheKey():
+                window.setWindowIcon(self.brand_icon)
+        if self.ribbon is not None:
+            button = self.ribbon.file_button
+            button.setIcon(self.brand_icon)
+            button.setIconSize(QtCore.QSize(20, 20))
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            button.setAccessibleName("PRISMA File")
+            button.setToolTip("PRISMA File")
 
     def apply_theme(self):
         from .. import prefs, config, theme
@@ -275,6 +298,7 @@ class Shell(QtCore.QObject):
 
     def refresh(self):
         from .ui import current
+        self.apply_branding()
         if "/* NXStyle theme */" not in QtWidgets.QApplication.instance().styleSheet():
             self.apply_theme()
         self.commands.update_actions()
