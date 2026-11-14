@@ -2,6 +2,13 @@
 
 # FreeCAD NX-Style
 
+> This branch is the pinned UI component of [PRISMA](https://github.com/romainastie/FreeCAD/tree/prisma/main).
+> Its new modeling commands require PRISMA's compiled FreeCAD module. Launch
+> them through PRISMA's isolated profile (`PRISMA_PROFILE=1`); the legacy shell
+> remains opt-in through `NXSTYLE_PROFILE`. The original project documentation
+> and attribution below describe the upstream base. Manufacturing and data
+> management integrations remain optional.
+
 Run your normal, unmodified FreeCAD with a user interface laid out and behaving like Siemens NX: ribbon, Top Border Bar, Resource Bar, NX mouse buttons, NX shortcuts, NX names. Data management, the job Teamcenter does next to NX, comes from [Strata](https://github.com/Foadsf/freecad-strata): every save recorded, versions, workspaces, releases. There is no fork, no patch, and your usual FreeCAD settings are never touched.
 
 **Documentation: [foadsf.github.io/freecad-nxstyle](https://foadsf.github.io/freecad-nxstyle)**: installation, a five-minute first part, step-by-step tutorials (textbook exercises and precision-engineering work), every keyboard shortcut and every setting.

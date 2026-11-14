@@ -21,6 +21,7 @@ then handed to FreeCAD unchanged; only the hold and the select-through click are
 """
 
 import math
+import os
 import time
 
 import FreeCAD as App
@@ -35,6 +36,14 @@ MOVE_THRESHOLD = 3
 # A click answers the QuickPick dots only if it comes this long after they appeared: a press already
 # queued while FreeCAD was busy (the rest timer fired late) is an ordinary click
 REACT_S = 0.15
+
+
+def prisma_command():
+    """Only the opt-in PRISMA profile owns the new command-state dispatcher."""
+    if os.environ.get("PRISMA_PROFILE") != "1":
+        return None
+    from .prisma.ui import current
+    return current()
 
 
 def _coin():
@@ -348,7 +357,10 @@ class NxMouse(QtCore.QObject):
         except Exception:
             return False
 
-    def _mb2_click(self):
+    def _mb2_click(self, modifiers=Qt.NoModifier):
+        prisma = prisma_command()
+        if prisma is not None and prisma.middle_click(modifiers):
+            return
         if in_sketch_edit():
             # NX: MB2 ends the current curve tool; Esc does that in FreeCAD. In continuous creation mode
             # FreeCAD's first Esc only ends an open profile and keeps the tool (it puts its cursor back);
@@ -368,6 +380,13 @@ class NxMouse(QtCore.QObject):
         if not self.rmb_pending:
             return
         self.rmb_pending = False
+        prisma = prisma_command()
+        if prisma is not None:
+            prisma.update()
+            menu = RadialMenu(prisma.context_items(), Gui.getMainWindow())
+            self.last_radial = menu
+            menu.popup_at(self.rmb_global)
+            return
         info = self.pick(self.rmb_pos)
         spec = VIEW_RADIAL
         if info and info.get("Object"):
@@ -378,7 +397,16 @@ class NxMouse(QtCore.QObject):
                 Gui.Selection.clearSelection()
                 Gui.Selection.addSelection(doc, obj, sub or "")
             spec = OBJECT_RADIAL
-        menu = RadialMenu(radial_items(spec), Gui.getMainWindow())
+            if os.environ.get("PRISMA_PROFILE") == "1":
+                spec = [(label, "Prisma_EditParameters" if label == "Edit Parameters" else cmd)
+                        for label, cmd in OBJECT_RADIAL]
+        items = radial_items(spec)
+        if os.environ.get("PRISMA_PROFILE") == "1":
+            from .prisma.boot import instance
+            shell = instance()
+            if shell is not None:
+                items = shell.role_radial_items(info) or items
+        menu = RadialMenu(items, Gui.getMainWindow())
         self.last_radial = menu
         menu.popup_at(self.rmb_global)
 
@@ -582,6 +610,10 @@ class NxMouse(QtCore.QObject):
                     return True
                 if self.rmb_pending:
                     self._release_pending_rmb(press_only=True)
+                prisma = prisma_command()
+                if prisma is not None and prisma.pointer(self, p):
+                    self.swallow_release = Qt.LeftButton
+                    return True
                 if own and self._defer_lmb(ev):
                     self.lmb_pending = True
                     self.lmb_pos = p
@@ -624,7 +656,7 @@ class NxMouse(QtCore.QObject):
                 self.mb2 = False
                 self.hold_timer.stop()
                 if not self.moved and not self.hold_used and time.monotonic() - self.t0 < 0.6:
-                    self._mb2_click()
+                    self._mb2_click(ev.modifiers())
                 if self.hold_used:
                     self.widget.unsetCursor()     # only the rotation point's cross; a sketch tool keeps its own
                 self.pivot = None
@@ -648,6 +680,10 @@ class NxMouse(QtCore.QObject):
         """A short MB3 click (or MB3 drag): hand it to FreeCAD unchanged."""
         self.radial_timer.stop()
         self.rmb_pending = False
+        prisma = prisma_command()
+        if not press_only and prisma is not None:
+            prisma.context_menu(self.rmb_global)
+            return
         self.replay(QtCore.QEvent.MouseButtonPress, Qt.RightButton, self.rmb_pos)
         if not press_only:
             self.replay(QtCore.QEvent.MouseButtonRelease, Qt.RightButton, self.rmb_pos)

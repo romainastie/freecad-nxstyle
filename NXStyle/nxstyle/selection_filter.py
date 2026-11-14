@@ -60,7 +60,8 @@ def type_ok(kind, obj, sub):
     if k == "edge":
         return element.startswith("Edge")
     if k == "vertex":
-        return element.startswith("Vertex") or leaf.TypeId == "PartDesign::Point"
+        return (element.startswith("Vertex") or leaf.TypeId in ("PartDesign::Point", "App::Point")
+                or leaf.isDerivedFrom("Part::DatumPoint"))
     if k == "curve":
         if element.startswith("Edge"):
             return True
@@ -159,6 +160,23 @@ class Resolved(core.Pick):
         where = core.path_text(path, self.labels)
         super().__init__(docname, top.Name, sub, kind, self.body.Name if self.body is not None else "",
                          f"{element} of {where}" if element else where)
+        # Native Part features are often selected by their own name, while the
+        # work part is an App::Part. Include that geometric ownership for scope
+        # checks without changing the actual FreeCAD selection identity.
+        ancestors = []
+        try:
+            parent = top.getParentGeoFeatureGroup()
+            while parent is not None and len(ancestors) < 64 and parent not in ancestors:
+                ancestors.insert(0, parent)
+                parent = parent.getParentGeoFeatureGroup()
+        except (RuntimeError, AttributeError):
+            pass
+        if ancestors:
+            self.path = tuple(obj.Name for obj in ancestors) + self.path
+            self.components = tuple(is_component(obj) for obj in ancestors) + self.components
+            self.labels.update({obj.Name: obj.Label for obj in ancestors})
+            where = core.path_text(self.path, self.labels)
+            self.label = f"{element} of {where}" if element else where
         self.top_obj = top
         self.through_link = next((o for o in objs[1:-1] if o is not None and o.isDerivedFrom("App::Link")), None)
 
